@@ -19,7 +19,7 @@ package org.apache.spark.ml.feature
 
 import org.apache.hadoop.fs.Path
 
-import org.apache.spark.annotation.{Experimental, Since}
+import org.apache.spark.annotation.Since
 import org.apache.spark.ml.{Estimator, Model}
 import org.apache.spark.ml.linalg.{Vector, Vectors, VectorUDT}
 import org.apache.spark.ml.param.{ParamMap, Params}
@@ -48,12 +48,10 @@ private[feature] trait MaxAbsScalerParams extends Params with HasInputCol with H
 }
 
 /**
- * :: Experimental ::
  * Rescale each feature individually to range [-1, 1] by dividing through the largest maximum
  * absolute value in each feature. It does not shift/center the data, and thus does not destroy
  * any sparsity.
  */
-@Experimental
 @Since("2.0.0")
 class MaxAbsScaler @Since("2.0.0") (@Since("2.0.0") override val uid: String)
   extends Estimator[MaxAbsScalerModel] with MaxAbsScalerParams with DefaultParamsWritable {
@@ -101,11 +99,9 @@ object MaxAbsScaler extends DefaultParamsReadable[MaxAbsScaler] {
 }
 
 /**
- * :: Experimental ::
  * Model fitted by [[MaxAbsScaler]].
  *
  */
-@Experimental
 @Since("2.0.0")
 class MaxAbsScalerModel private[ml] (
     @Since("2.0.0") override val uid: String,
@@ -161,7 +157,7 @@ object MaxAbsScalerModel extends MLReadable[MaxAbsScalerModel] {
       DefaultParamsWriter.saveMetadata(instance, path, sc)
       val data = new Data(instance.maxAbs)
       val dataPath = new Path(path, "data").toString
-      sqlContext.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)
+      sparkSession.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)
     }
   }
 
@@ -172,7 +168,7 @@ object MaxAbsScalerModel extends MLReadable[MaxAbsScalerModel] {
     override def load(path: String): MaxAbsScalerModel = {
       val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
       val dataPath = new Path(path, "data").toString
-      val Row(maxAbs: Vector) = sqlContext.read.parquet(dataPath)
+      val Row(maxAbs: Vector) = sparkSession.read.parquet(dataPath)
         .select("maxAbs")
         .head()
       val model = new MaxAbsScalerModel(metadata.uid, maxAbs)

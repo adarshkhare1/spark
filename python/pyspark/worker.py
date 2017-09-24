@@ -27,9 +27,12 @@ import traceback
 
 from pyspark.accumulators import _accumulatorRegistry
 from pyspark.broadcast import Broadcast, _broadcastRegistry
+from pyspark.taskcontext import TaskContext
 from pyspark.files import SparkFiles
 from pyspark.serializers import write_with_length, write_int, read_long, \
-    write_long, read_int, SpecialLengths, UTF8Deserializer, PickleSerializer, BatchedSerializer
+    write_long, read_int, SpecialLengths, PythonEvalType, UTF8Deserializer, PickleSerializer, \
+    BatchedSerializer, ArrowPandasSerializer
+from pyspark.sql.types import toArrowType
 from pyspark import shuffle
 
 pickleSer = PickleSerializer()
@@ -57,9 +60,12 @@ def read_command(serializer, file):
     return command
 
 
-def chain(f, g):
-    """chain two function together """
-    return lambda *a: g(f(*a))
+def chain(f, g, eval_type):
+    """chain two functions together """
+    if eval_type == PythonEvalType.SQL_PANDAS_UDF:
+        return lambda *a, **kwargs: g(f(*a, **kwargs), **kwargs)
+    else:
+        return lambda *a: g(f(*a))
 
 
 def wrap_udf(f, return_type):
@@ -70,7 +76,21 @@ def wrap_udf(f, return_type):
         return lambda *a: f(*a)
 
 
-def read_single_udf(pickleSer, infile):
+def wrap_pandas_udf(f, return_type):
+    arrow_return_type = toArrowType(return_type)
+
+    def verify_result_length(*a):
+        kwargs = a[-1]
+        result = f(*a[:-1], **kwargs)
+        if len(result) != kwargs["length"]:
+            raise RuntimeError("Result vector from pandas_udf was not the required length: "
+                               "expected %d, got %d\nUse input vector length or kwargs['length']"
+                               % (kwargs["length"], len(result)))
+        return result, arrow_return_type
+    return lambda *a: verify_result_length(*a)
+
+
+def read_single_udf(pickleSer, infile, eval_type):
     num_arg = read_int(infile)
     arg_offsets = [read_int(infile) for i in range(num_arg)]
     row_func = None
@@ -79,32 +99,39 @@ def read_single_udf(pickleSer, infile):
         if row_func is None:
             row_func = f
         else:
-            row_func = chain(row_func, f)
+            row_func = chain(row_func, f, eval_type)
     # the last returnType will be the return type of UDF
-    return arg_offsets, wrap_udf(row_func, return_type)
-
-
-def read_udfs(pickleSer, infile):
-    num_udfs = read_int(infile)
-    if num_udfs == 1:
-        # fast path for single UDF
-        _, udf = read_single_udf(pickleSer, infile)
-        mapper = lambda a: udf(*a)
+    if eval_type == PythonEvalType.SQL_PANDAS_UDF:
+        # A pandas_udf will take kwargs as the last argument
+        arg_offsets = arg_offsets + [-1]
+        return arg_offsets, wrap_pandas_udf(row_func, return_type)
     else:
-        udfs = {}
-        call_udf = []
-        for i in range(num_udfs):
-            arg_offsets, udf = read_single_udf(pickleSer, infile)
-            udfs['f%d' % i] = udf
-            args = ["a[%d]" % o for o in arg_offsets]
-            call_udf.append("f%d(%s)" % (i, ", ".join(args)))
-        # Create function like this:
-        #   lambda a: (f0(a0), f1(a1, a2), f2(a3))
-        mapper_str = "lambda a: (%s)" % (", ".join(call_udf))
-        mapper = eval(mapper_str, udfs)
+        return arg_offsets, wrap_udf(row_func, return_type)
+
+
+def read_udfs(pickleSer, infile, eval_type):
+    num_udfs = read_int(infile)
+    udfs = {}
+    call_udf = []
+    for i in range(num_udfs):
+        arg_offsets, udf = read_single_udf(pickleSer, infile, eval_type)
+        udfs['f%d' % i] = udf
+        args = ["a[%d]" % o for o in arg_offsets]
+        call_udf.append("f%d(%s)" % (i, ", ".join(args)))
+    # Create function like this:
+    #   lambda a: (f0(a0), f1(a1, a2), f2(a3))
+    # In the special case of a single UDF this will return a single result rather
+    # than a tuple of results; this is the format that the JVM side expects.
+    mapper_str = "lambda a: (%s)" % (", ".join(call_udf))
+    mapper = eval(mapper_str, udfs)
 
     func = lambda _, it: map(mapper, it)
-    ser = BatchedSerializer(PickleSerializer(), 100)
+
+    if eval_type == PythonEvalType.SQL_PANDAS_UDF:
+        ser = ArrowPandasSerializer()
+    else:
+        ser = BatchedSerializer(PickleSerializer(), 100)
+
     # profiling is not supported for UDF
     return func, None, ser, ser
 
@@ -119,10 +146,17 @@ def main(infile, outfile):
         version = utf8_deserializer.loads(infile)
         if version != "%d.%d" % sys.version_info[:2]:
             raise Exception(("Python in worker has different version %s than that in " +
-                             "driver %s, PySpark cannot run with different minor versions") %
+                             "driver %s, PySpark cannot run with different minor versions." +
+                             "Please check environment variables PYSPARK_PYTHON and " +
+                             "PYSPARK_DRIVER_PYTHON are correctly set.") %
                             ("%d.%d" % sys.version_info[:2], version))
 
         # initialize global state
+        taskContext = TaskContext._getOrCreate()
+        taskContext._stageId = read_int(infile)
+        taskContext._partitionId = read_int(infile)
+        taskContext._attemptNumber = read_int(infile)
+        taskContext._taskAttemptId = read_long(infile)
         shuffle.MemoryBytesSpilled = 0
         shuffle.DiskBytesSpilled = 0
         _accumulatorRegistry.clear()
@@ -154,11 +188,11 @@ def main(infile, outfile):
                 _broadcastRegistry.pop(bid)
 
         _accumulatorRegistry.clear()
-        is_sql_udf = read_int(infile)
-        if is_sql_udf:
-            func, profiler, deserializer, serializer = read_udfs(pickleSer, infile)
-        else:
+        eval_type = read_int(infile)
+        if eval_type == PythonEvalType.NON_UDF:
             func, profiler, deserializer, serializer = read_command(pickleSer, infile)
+        else:
+            func, profiler, deserializer, serializer = read_udfs(pickleSer, infile, eval_type)
 
         init_time = time.time()
 

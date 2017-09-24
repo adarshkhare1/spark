@@ -35,6 +35,11 @@ import org.apache.spark.unsafe.Platform;
  * if the fields of row are all fixed-length, as the size of result row is also fixed.
  */
 public class BufferHolder {
+
+  // Some JVMs can't allocate arrays of length Integer.MAX_VALUE; actual max is somewhat
+  // smaller. Be conservative and lower the cap a little.
+  private static final int ARRAY_MAX = Integer.MAX_VALUE - 8;
+
   public byte[] buffer;
   public int cursor = Platform.BYTE_ARRAY_OFFSET;
   private final UnsafeRow row;
@@ -45,7 +50,13 @@ public class BufferHolder {
   }
 
   public BufferHolder(UnsafeRow row, int initialSize) {
-    this.fixedSize = UnsafeRow.calculateBitSetWidthInBytes(row.numFields()) + 8 * row.numFields();
+    int bitsetWidthInBytes = UnsafeRow.calculateBitSetWidthInBytes(row.numFields());
+    if (row.numFields() > (Integer.MAX_VALUE - initialSize - bitsetWidthInBytes) / 8) {
+      throw new UnsupportedOperationException(
+        "Cannot create BufferHolder for input UnsafeRow because there are " +
+          "too many fields (number of fields: " + row.numFields() + ")");
+    }
+    this.fixedSize = bitsetWidthInBytes + 8 * row.numFields();
     this.buffer = new byte[fixedSize + initialSize];
     this.row = row;
     this.row.pointTo(buffer, buffer.length);
@@ -55,10 +66,16 @@ public class BufferHolder {
    * Grows the buffer by at least neededSize and points the row to the buffer.
    */
   public void grow(int neededSize) {
+    if (neededSize > ARRAY_MAX - totalSize()) {
+      throw new UnsupportedOperationException(
+        "Cannot grow BufferHolder by size " + neededSize + " because the size after growing " +
+          "exceeds size limitation " + ARRAY_MAX);
+    }
     final int length = totalSize() + neededSize;
     if (buffer.length < length) {
       // This will not happen frequently, because the buffer is re-used.
-      final byte[] tmp = new byte[length * 2];
+      int newLength = length < ARRAY_MAX / 2 ? length * 2 : ARRAY_MAX;
+      final byte[] tmp = new byte[newLength];
       Platform.copyMemory(
         buffer,
         Platform.BYTE_ARRAY_OFFSET,

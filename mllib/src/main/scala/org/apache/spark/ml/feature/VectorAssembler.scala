@@ -20,7 +20,7 @@ package org.apache.spark.ml.feature
 import scala.collection.mutable.ArrayBuilder
 
 import org.apache.spark.SparkException
-import org.apache.spark.annotation.{Experimental, Since}
+import org.apache.spark.annotation.Since
 import org.apache.spark.ml.Transformer
 import org.apache.spark.ml.attribute.{Attribute, AttributeGroup, NumericAttribute, UnresolvedAttribute}
 import org.apache.spark.ml.linalg.{Vector, Vectors, VectorUDT}
@@ -32,10 +32,8 @@ import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
 
 /**
- * :: Experimental ::
  * A feature transformer that merges multiple columns into a vector column.
  */
-@Experimental
 @Since("1.4.0")
 class VectorAssembler @Since("1.4.0") (@Since("1.4.0") override val uid: String)
   extends Transformer with HasInputCols with HasOutputCol with DefaultParamsWritable {
@@ -53,6 +51,7 @@ class VectorAssembler @Since("1.4.0") (@Since("1.4.0") override val uid: String)
 
   @Since("2.0.0")
   override def transform(dataset: Dataset[_]): DataFrame = {
+    transformSchema(dataset.schema, logging = true)
     // Schema transformation.
     val schema = dataset.schema
     lazy val first = dataset.toDF.first()
@@ -114,12 +113,15 @@ class VectorAssembler @Since("1.4.0") (@Since("1.4.0") override val uid: String)
   override def transformSchema(schema: StructType): StructType = {
     val inputColNames = $(inputCols)
     val outputColName = $(outputCol)
-    val inputDataTypes = inputColNames.map(name => schema(name).dataType)
-    inputDataTypes.foreach {
-      case _: NumericType | BooleanType =>
-      case t if t.isInstanceOf[VectorUDT] =>
-      case other =>
-        throw new IllegalArgumentException(s"Data type $other is not supported.")
+    val incorrectColumns = inputColNames.flatMap { name =>
+      schema(name).dataType match {
+        case _: NumericType | BooleanType => None
+        case t if t.isInstanceOf[VectorUDT] => None
+        case other => Some(s"Data type $other of column $name is not supported.")
+      }
+    }
+    if (incorrectColumns.nonEmpty) {
+      throw new IllegalArgumentException(incorrectColumns.mkString("\n"))
     }
     if (schema.fieldNames.contains(outputColName)) {
       throw new IllegalArgumentException(s"Output column $outputColName already exists.")
